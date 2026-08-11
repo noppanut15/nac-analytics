@@ -10,7 +10,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import typer
 from dotenv import find_dotenv, load_dotenv
@@ -49,12 +49,15 @@ from nac_nd.pipeline import finish_delta_analysis
 from nac_nd.progress import note
 from nac_nd.report import (
     DEFAULT_FAIL_ON,
+    GATE_DEFAULT_OUTPUT,
+    GATE_REPORT_FILES,
     OUTPUT_FORMATS,
     MultiFabricResult,
     Result,
     parse_fail_on,
     render,
     render_multi,
+    serialize_structured,
 )
 from nac_nd.settings import bootstrap_settings, configured_fabrics
 from nac_nd.tf_plan import prepare_prechange_content
@@ -223,6 +226,27 @@ DetailOpt = Annotated[
         ),
     ),
 ]
+ReportFileOpt = Annotated[
+    Optional[str],
+    typer.Option(
+        "--report-file",
+        help=(
+            "JUnit report path for prechange/delta (default: prechange-report.xml "
+            "or delta-report.xml). Use '-' for stdout."
+        ),
+    ),
+]
+GateOutputOpt = Annotated[
+    str,
+    typer.Option(
+        "--output",
+        "-o",
+        help=(
+            f"Output format: {', '.join(OUTPUT_FORMATS)}. "
+            "Gate commands default to junit (written to --report-file)."
+        ),
+    ),
+]
 
 
 # -- plumbing --------------------------------------------------------------
@@ -290,8 +314,127 @@ def _auto_name(prefix: str) -> str:
     return f"nac-nd-{prefix}-{stamp}"
 
 
+def _prechange_result_from_job(
+    client: NDClient,
+    config: Config,
+    *,
+    job: dict[str, Any],
+    job_id: str,
+    job_name: str,
+    config_file: Path | None,
+    thresholds: tuple[str, ...],
+    detail_level: str,
+    include_acknowledged: bool,
+    since: str | None,
+    until: str | None,
+) -> Result:
+    """Collect gate results from a finished pre-change analysis job."""
+    job_fabric = str(job.get("fabricName", "")).strip()
+    if job_fabric and job_fabric != config.fabric:
+        raise InputError(
+            f"Pre-change analysis {job_id} belongs to fabric {job_fabric!r}, "
+            f"not {config.fabric!r}."
+        )
+    base_snapshot_id = str(job.get("baseSnapshotId", "")).strip()
+    if not base_snapshot_id:
+        raise InputError(
+            f"Pre-change analysis {job_id} has no baseSnapshotId; "
+            "cannot load baseline compliance."
+        )
+    snapshot = client.resolve_snapshot(
+        config.fabric,
+        base_snapshot_id,
+        start_date=since,
+        end_date=until,
+    )
+    delta_job_id = prechange_delta_job_id(job)
+    note("Collecting change approval detail...")
+    compliance = compliance_for_snapshot(
+        client,
+        config.fabric,
+        snapshot,
+        scope="baseline snapshot (before change)",
+    )
+    details: dict[str, object] = {
+        "prechange_ui_url": config.prechange_ui_url,
+        "job_id": job_id,
+        "delta_job_id": delta_job_id,
+        **snapshot_details("base", snapshot),
+        **prechange_job_details(job),
+    }
+    uploaded = str(job.get("uploadedFileName", ""))
+    config_label = str(config_file) if config_file else uploaded
+    if config_label:
+        details["config_file"] = config_label
+    return finish_delta_analysis(
+        client,
+        command="prechange",
+        fabric=config.fabric,
+        name=job_name,
+        job_id=delta_job_id,
+        thresholds=thresholds,
+        detail_level=detail_level,
+        include_acknowledged=include_acknowledged,
+        details=details,
+        compliance=compliance,
+    )
+
+
 def _emit(result: Result, output: str) -> None:
     typer.echo(render(result, output))
+
+
+def _emit_gate_result(
+    result: Result,
+    *,
+    output: str,
+    report_file: str | None,
+) -> None:
+    """Write gate command output: JUnit to file by default, verdict on stderr."""
+    if output == "junit":
+        rendered = render(result, "junit")
+        if report_file == "-":
+            typer.echo(rendered)
+        else:
+            path = Path(report_file or GATE_REPORT_FILES[result.command])
+            path.write_text(rendered, encoding="utf-8")
+        if result.verdict is not None:
+            status = "PASS" if result.verdict.passed else "FAIL"
+            typer.secho(f"DECISION: {status} — {result.verdict.reason}", err=True)
+        return
+    typer.echo(render(result, output))
+
+
+def _emit_snapshot(record: dict[str, object], output: str) -> None:
+    if output == "text":
+        typer.echo(str(record.get("snapshotId", "")))
+        return
+    typer.echo(serialize_structured(record, output))
+
+
+def _resolve_pre_post(
+    pre: str | None,
+    post: str | None,
+    *,
+    prior: str | None,
+    later: str | None,
+    default_pre: str,
+    default_post: str,
+) -> tuple[str, str]:
+    """Merge positional pre/post selectors with deprecated --prior/--later flags."""
+    if pre is not None:
+        pre_selector = pre
+    elif prior is not None:
+        pre_selector = prior
+    else:
+        pre_selector = default_pre
+    if post is not None:
+        post_selector = post
+    elif later is not None:
+        post_selector = later
+    else:
+        post_selector = default_post
+    return pre_selector, post_selector
 
 
 def _enforce(verdict_result: Result) -> None:
@@ -306,17 +449,23 @@ def _enforce(verdict_result: Result) -> None:
 @app.command()
 def prechange(
     config_file: Annotated[
-        Path,
+        Optional[Path],
         typer.Argument(
             # Typer's exists/dir_okay/readable checks exit 2, which is
             # reserved for a failed job. Input is validated below so it
             # exits 4.
             help=(
                 "Candidate configuration: Terraform plan JSON "
-                "(terraform show -json) or APIC MO JSON."
+                "(terraform show -json) or APIC MO JSON. Omit with --job-id."
             ),
         ),
-    ],
+    ] = None,
+    baseline: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Baseline snapshot: 'latest', 'latest-N', or a snapshotId.",
+        ),
+    ] = None,
     host: HostOpt = None,
     username: UserOpt = None,
     password: PasswordOpt = None,
@@ -325,20 +474,32 @@ def prechange(
     name: Annotated[
         Optional[str], typer.Option("--name", help="Job name; generated when omitted.")
     ] = None,
+    job_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--job-id",
+            help=(
+                "Resume or fetch an existing pre-change analysis by job ID "
+                "(no config upload)."
+            ),
+        ),
+    ] = None,
     base_snapshot: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--base-snapshot",
-            help="Baseline snapshot: 'latest', 'latest-N' or a snapshotId.",
+            hidden=True,
+            help="Deprecated; use the baseline positional argument.",
         ),
-    ] = "latest",
+    ] = None,
     fail_on: FailOnOpt = FAIL_ON_DEFAULT,
     include_acknowledged: AckOpt = False,
     since: SinceOpt = None,
     until: UntilOpt = None,
     cleanup: CleanupOpt = False,
     detail: DetailOpt = PRECHANGE_DEFAULT_DETAIL,
-    output: OutputOpt = "text",
+    output: GateOutputOpt = GATE_DEFAULT_OUTPUT,
+    report_file: ReportFileOpt = None,
     verify_ssl: VerifyOpt = True,
     ca_bundle: CaBundleOpt = None,
     timeout: TimeoutOpt = 30,
@@ -350,13 +511,25 @@ def prechange(
     Accepts Terraform plan JSON from `terraform show -json plan.tfplan` as well
     as APIC managed-object JSON. Terraform plans are converted automatically.
 
-    Writes the change approval report to stdout, then exits 3 when the DECISION
-    is FAIL (new anomalies at or above --fail-on). Use --fail-on none to report
-    without failing CI.
+    By default writes JUnit to prechange-report.xml and exits 3 when new
+    critical/major anomalies would be introduced. Use --output text for a full
+    human-readable report. Use --job-id to resume or fetch an existing analysis
+    without uploading a config again.
     """
     _configure_logging(verbose)
     try:
         thresholds = parse_fail_on(fail_on)
+        if job_id and config_file is not None:
+            raise InputError("Pass a config file or --job-id, not both.")
+        if not job_id and config_file is None:
+            raise InputError("A config file is required unless --job-id is given.")
+        baseline_selector = (
+            baseline
+            if baseline is not None
+            else base_snapshot
+            if base_snapshot is not None
+            else "latest"
+        )
         config = _build_config(
             host=host,
             username=username,
@@ -368,67 +541,85 @@ def prechange(
             timeout=timeout,
             poll_interval=poll_interval,
         )
-        job_name = name or _auto_name("prechange")
-        if not config_file.exists():
-            raise InputError(f"{config_file} does not exist.")
-        if not config_file.is_file():
-            raise InputError(f"{config_file} is not a file.")
-        try:
-            content = config_file.read_bytes()
-        except OSError as exc:
-            raise InputError(f"{config_file} cannot be read: {exc.strerror}.") from exc
-        if not content.strip():
-            raise InputError(f"{config_file} is empty.")
-        content = prepare_prechange_content(content)
+        detail_level = normalize_delta_detail(detail)
+        upload_content: bytes | None = None
+        upload_name = ""
+        if job_id:
+            resume_id = job_id.strip()
+            if not resume_id:
+                raise InputError("--job-id must not be empty.")
+        else:
+            assert config_file is not None
+            if not config_file.exists():
+                raise InputError(f"{config_file} does not exist.")
+            if not config_file.is_file():
+                raise InputError(f"{config_file} is not a file.")
+            try:
+                content = config_file.read_bytes()
+            except OSError as exc:
+                raise InputError(
+                    f"{config_file} cannot be read: {exc.strerror}."
+                ) from exc
+            if not content.strip():
+                raise InputError(f"{config_file} is empty.")
+            upload_content = prepare_prechange_content(content)
+            upload_name = config_file.name
         note(_connect_message(config))
         with NDClient(config) as client:
             client.validate_fabric(config.fabric)
-            snapshot = client.resolve_snapshot(
-                config.fabric, base_snapshot, start_date=since, end_date=until
-            )
-            note("Submitting pre-change analysis...")
-            created = client.create_prechange_analysis(
-                fabric=config.fabric,
-                name=job_name,
-                base_snapshot=snapshot,
-                file_name=config_file.name,
-                content=content,
-            )
-            job_id = str(created.get("jobId", ""))
-            if not job_id:
-                raise ApiError(
-                    "Nexus Dashboard accepted the upload but returned no jobId."
+            if job_id:
+                assert resume_id is not None
+                note(f"Waiting for pre-change analysis {resume_id}...")
+                job = client.wait_prechange_analysis(resume_id)
+                job_name = name or str(job.get("name") or resume_id)
+                result = _prechange_result_from_job(
+                    client,
+                    config,
+                    job=job,
+                    job_id=resume_id,
+                    job_name=job_name,
+                    config_file=None,
+                    thresholds=thresholds,
+                    detail_level=detail_level,
+                    include_acknowledged=include_acknowledged,
+                    since=since,
+                    until=until,
                 )
-            note(f"Waiting for pre-change analysis {job_id}...")
-            job = client.wait_prechange_analysis(job_id)
-            delta_job_id = prechange_delta_job_id(job)
-            detail_level = normalize_delta_detail(detail)
-            note("Collecting change approval detail...")
-            compliance = compliance_for_snapshot(
-                client,
-                config.fabric,
-                snapshot,
-                scope="baseline snapshot (before change)",
-            )
-            result = finish_delta_analysis(
-                client,
-                command="prechange",
-                fabric=config.fabric,
-                name=job_name,
-                job_id=delta_job_id,
-                thresholds=thresholds,
-                detail_level=detail_level,
-                include_acknowledged=include_acknowledged,
-                details={
-                    "prechange_ui_url": config.prechange_ui_url,
-                    "job_id": job_id,
-                    "delta_job_id": delta_job_id,
-                    **snapshot_details("base", snapshot),
-                    "config_file": str(config_file),
-                    **prechange_job_details(job),
-                },
-                compliance=compliance,
-            )
+            else:
+                assert config_file is not None
+                assert upload_content is not None
+                job_name = name or _auto_name("prechange")
+                snapshot = client.resolve_snapshot(
+                    config.fabric, baseline_selector, start_date=since, end_date=until
+                )
+                note("Submitting pre-change analysis...")
+                created = client.create_prechange_analysis(
+                    fabric=config.fabric,
+                    name=job_name,
+                    base_snapshot=snapshot,
+                    file_name=upload_name,
+                    content=upload_content,
+                )
+                new_job_id = str(created.get("jobId", ""))
+                if not new_job_id:
+                    raise ApiError(
+                        "Nexus Dashboard accepted the upload but returned no jobId."
+                    )
+                note(f"Waiting for pre-change analysis {new_job_id}...")
+                job = client.wait_prechange_analysis(new_job_id)
+                result = _prechange_result_from_job(
+                    client,
+                    config,
+                    job=job,
+                    job_id=new_job_id,
+                    job_name=job_name,
+                    config_file=config_file,
+                    thresholds=thresholds,
+                    detail_level=detail_level,
+                    include_acknowledged=include_acknowledged,
+                    since=since,
+                    until=until,
+                )
             _extend_warnings(result, client)
             if cleanup:
                 leftover = client.cleanup_prechange(config.fabric, job)
@@ -440,7 +631,7 @@ def prechange(
                     "the pre-change snapshot this analysis created has no "
                     "DELETE route on the GA API and remains on the fabric"
                 )
-        _emit(result, output)
+        _emit_gate_result(result, output=output, report_file=report_file)
         _enforce(result)
     except Exception as exc:
         raise _fail(exc, verbose) from exc
@@ -448,25 +639,39 @@ def prechange(
 
 @app.command()
 def delta(
+    pre: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Pre-change snapshot: 'latest', 'latest-N', or a snapshotId.",
+        ),
+    ] = None,
+    post: Annotated[
+        Optional[str],
+        typer.Argument(
+            help="Post-change snapshot: 'latest', 'latest-N', or a snapshotId.",
+        ),
+    ] = None,
     host: HostOpt = None,
     username: UserOpt = None,
     password: PasswordOpt = None,
     domain: DomainOpt = DEFAULT_DOMAIN,
     fabric: FabricOpt = None,
     prior: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--prior",
-            help="Earlier snapshot: 'latest', 'latest-N', or a snapshotId.",
+            hidden=True,
+            help="Deprecated; use the pre positional argument.",
         ),
-    ] = "latest-1",
+    ] = None,
     later: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--later",
-            help="Later snapshot: 'latest', 'latest-N', or a snapshotId.",
+            hidden=True,
+            help="Deprecated; use the post positional argument.",
         ),
-    ] = "latest",
+    ] = None,
     name: Annotated[
         Optional[str], typer.Option("--name", help="Job name; generated when omitted.")
     ] = None,
@@ -476,7 +681,8 @@ def delta(
     until: UntilOpt = None,
     cleanup: CleanupOpt = False,
     detail: DetailOpt = DEFAULT_DELTA_DETAIL,
-    output: OutputOpt = "text",
+    output: GateOutputOpt = GATE_DEFAULT_OUTPUT,
+    report_file: ReportFileOpt = None,
     verify_ssl: VerifyOpt = True,
     ca_bundle: CaBundleOpt = None,
     timeout: TimeoutOpt = 30,
@@ -485,11 +691,20 @@ def delta(
 ) -> None:
     """Compare two snapshots of a fabric and report what changed.
 
-    Exits 3 when new anomalies reach the --fail-on threshold.
+    Usage: nac-nd delta [pre] [post] — defaults to latest-1 vs latest.
+    By default writes JUnit to delta-report.xml and exits 3 on critical/major.
     """
     _configure_logging(verbose)
     try:
         thresholds = parse_fail_on(fail_on)
+        pre_selector, post_selector = _resolve_pre_post(
+            pre,
+            post,
+            prior=prior,
+            later=later,
+            default_pre="latest-1",
+            default_post="latest",
+        )
         config = _build_config(
             host=host,
             username=username,
@@ -505,19 +720,19 @@ def delta(
         note(_connect_message(config))
         with NDClient(config) as client:
             client.validate_fabric(config.fabric)
-            prior_snapshot = client.resolve_snapshot(
-                config.fabric, prior, start_date=since, end_date=until
+            pre_snapshot = client.resolve_snapshot(
+                config.fabric, pre_selector, start_date=since, end_date=until
             )
-            later_snapshot = client.resolve_snapshot(
-                config.fabric, later, start_date=since, end_date=until
+            post_snapshot = client.resolve_snapshot(
+                config.fabric, post_selector, start_date=since, end_date=until
             )
-            prior_id, later_id = resolve_snapshot_ids(prior_snapshot, later_snapshot)
+            pre_id, post_id = resolve_snapshot_ids(pre_snapshot, post_snapshot)
             note("Starting delta analysis...")
             job_id = client.create_delta_job(
                 fabric=config.fabric,
                 job_name=job_name,
-                prior_id=prior_id,
-                later_id=later_id,
+                prior_id=pre_id,
+                later_id=post_id,
             )
             note(f"Waiting for delta analysis {job_id}...")
             # Returns only on COMPLETE, so the summary below is never read
@@ -535,15 +750,73 @@ def delta(
                 include_acknowledged=include_acknowledged,
                 details={
                     "job_id": job_id,
-                    **snapshot_details("prior", prior_snapshot),
-                    **snapshot_details("later", later_snapshot),
+                    **snapshot_details("pre", pre_snapshot),
+                    **snapshot_details("post", post_snapshot),
                 },
             )
             _extend_warnings(result, client)
             if cleanup:
                 client.remove_delta_jobs(config.fabric, [job_id])
-        _emit(result, output)
+        _emit_gate_result(result, output=output, report_file=report_file)
         _enforce(result)
+    except Exception as exc:
+        raise _fail(exc, verbose) from exc
+
+
+@app.command()
+def snapshots(
+    selector: Annotated[
+        str,
+        typer.Argument(
+            help="Snapshot to resolve: 'latest', 'latest-N', or a snapshotId.",
+        ),
+    ],
+    host: HostOpt = None,
+    username: UserOpt = None,
+    password: PasswordOpt = None,
+    domain: DomainOpt = DEFAULT_DOMAIN,
+    fabric: FabricOpt = None,
+    since: SinceOpt = None,
+    until: UntilOpt = None,
+    output: Annotated[
+        str,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output format: text (snapshot ID only), json, or yaml.",
+        ),
+    ] = "text",
+    verify_ssl: VerifyOpt = True,
+    ca_bundle: CaBundleOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Resolve a fabric snapshot and print its ID (for CI baseline pinning)."""
+    _configure_logging(verbose)
+    try:
+        if output not in ("text", "json", "yaml"):
+            raise InputError(
+                f"Unknown output format '{output}'. Choose from: text, json, yaml."
+            )
+        config = _build_config(
+            host=host,
+            username=username,
+            password=password,
+            domain=domain,
+            fabric=fabric,
+            verify_ssl=verify_ssl,
+            ca_bundle=ca_bundle,
+            timeout=30,
+            poll_interval=15,
+        )
+        note(_connect_message(config))
+        with NDClient(config) as client:
+            client.validate_fabric(config.fabric)
+            record = client.resolve_snapshot(
+                config.fabric, selector, start_date=since, end_date=until
+            )
+            for warning in client.notices:
+                typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
+        _emit_snapshot(record, output)
     except Exception as exc:
         raise _fail(exc, verbose) from exc
 

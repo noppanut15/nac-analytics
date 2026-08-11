@@ -53,6 +53,16 @@ def terraform_plan_to_payload(tf_plan: dict[str, Any]) -> bytes:
             "Terraform plan contains no aci_rest_managed create, update or "
             "delete changes."
         )
+    if len(root.children) > 1:
+        # The upload is a single JSON managed object, so more than one
+        # top-level DN root (e.g. both `uni/...` and `topology/...`) cannot be
+        # represented. Refusing beats silently uploading only the first root.
+        roots = ", ".join(str(child["dn"]) for child in root.children if child["dn"])
+        raise InputError(
+            "Terraform plan spans more than one top-level DN root "
+            f"({roots}); Nexus Dashboard accepts a single managed-object tree "
+            "per pre-change upload. Split the change into one plan per root."
+        )
     return str(root.children[0]).encode()
 
 

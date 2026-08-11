@@ -91,6 +91,27 @@ def test_an_empty_config_file_exits_4(tmp_path: Path) -> None:
     assert "is empty" in result.output
 
 
+def test_prechange_requires_config_or_job_id() -> None:
+    result = runner.invoke(app, ["prechange"], env=ENV)
+
+    assert result.exit_code == InputError.exit_code
+    assert "unless --job-id" in result.output
+
+
+def test_prechange_rejects_both_config_and_job_id(tmp_path: Path) -> None:
+    plan = tmp_path / "plan.json"
+    plan.write_text('{"imdata": []}')
+
+    result = runner.invoke(
+        app,
+        ["prechange", str(plan), "--job-id", "abc123"],
+        env=ENV,
+    )
+
+    assert result.exit_code == InputError.exit_code
+    assert "not both" in result.output
+
+
 # -- .env resolution -------------------------------------------------------
 
 

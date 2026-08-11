@@ -1,12 +1,20 @@
 # nac-nd YAML configuration (safe to commit).
 #
 # Copy to `nac-nd.yaml` or `~/.config/nac-nd/config.yaml`, or pass
-# `--config /path/to/this/file`. Keep secrets in `.env` or the environment:
-# ND_USER and ND_PASSWORD only (see `.env.example`).
+# `--config /path/to/this/file`.
+#
+# Keep secrets out of this file — use `.env` or the environment for
+# ND_USER and ND_PASSWORD (see `.env.example`).
 
+# Nexus Dashboard hostname or IP (HTTPS is assumed when no scheme is given).
 host: nd.example.com
+
+# Login domain (DefaultAuth, local, or your LDAP domain name).
 domain: DefaultAuth
+
+# TLS verification. Set false only on trusted lab clusters with self-signed certs.
 verify_ssl: true
+# ca_bundle: /path/to/nd-cluster-ca.pem
 
 # Default fabric when a command needs one and --fabric is omitted.
 fabric: FABRIC-A
@@ -16,10 +24,11 @@ fabrics:
   - FABRIC-A
   - FABRIC-B
 
+# Pre-change analysis can sit in ND's queue before running; raise on slow clusters.
 job_timeout_minutes: 30
 poll_interval: 15
 
-# Default for `delta --detail` and YAML override for both commands.
+# Default for `delta --detail` and YAML override for both gate commands.
 # prechange defaults to `full` when unset; delta defaults to `resources`.
 # Values: none, resources, anomalies, policy-diff, full
 delta_detail: resources

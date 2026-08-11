@@ -10,6 +10,7 @@ authors = [
 ]
 maintainers = [
     { name = "Ed Moore" },
+    { name = "Daniel Schmidt"},
 ]
 keywords = ["cisco", "nexus-dashboard", "aci", "pre-change", "validation", "cli"]
 classifiers = [

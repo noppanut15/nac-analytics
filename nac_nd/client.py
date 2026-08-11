@@ -247,7 +247,7 @@ def resolve_snapshot_ids(
         raise InputError("Both snapshots must carry a snapshotId to compare them.")
     if prior_id == later_id:
         raise InputError(
-            "The prior and later snapshots are the same "
+            "The pre and post snapshots are the same "
             f"({prior_id}); there is nothing to compare."
         )
     return prior_id, later_id
@@ -478,6 +478,9 @@ class NDClient:
         if resp.status_code == 401:
             logger.debug("Received 401; renewing the session token")
             self.refresh()
+            # The retry replays `kwargs` verbatim, so any body must be
+            # re-readable. Uploads pass `content=`/`files=` as bytes (not a
+            # file handle), which re-send cleanly on this second attempt.
             resp = self.client.request(method, url, **kwargs)
         if resp.status_code == 401:
             raise AuthError(

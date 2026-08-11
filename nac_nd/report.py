@@ -28,6 +28,14 @@ DEFAULT_FAIL_ON: tuple[str, ...] = ("critical", "major")
 
 OUTPUT_FORMATS: tuple[str, ...] = ("text", "json", "yaml", "markdown", "junit")
 
+# Gate commands (prechange, delta) default to JUnit written to these filenames.
+GATE_COMMANDS: tuple[str, ...] = ("prechange", "delta")
+GATE_DEFAULT_OUTPUT = "junit"
+GATE_REPORT_FILES: dict[str, str] = {
+    "prechange": "prechange-report.xml",
+    "delta": "delta-report.xml",
+}
+
 _PRECHANGE_IMPACT_FIELDS: tuple[tuple[str, str], ...] = (
     ("New anomalies", "newAnomaliesCount"),
     ("Cleared anomalies", "clearedAnomaliesCount"),
@@ -175,12 +183,25 @@ class MultiFabricResult:
 # -- rendering -------------------------------------------------------------
 
 
-def render(result: Result, output: str) -> str:
+def serialize_structured(data: Any, output: str) -> str:
+    """Render a mapping as JSON or YAML, the two format-agnostic outputs.
+
+    Shared by every command's json/yaml path so the dump options and the
+    unknown-format error stay identical everywhere.
+    """
     if output == "json":
-        return json.dumps(result.to_dict(), indent=2, sort_keys=False)
+        return json.dumps(data, indent=2, sort_keys=False)
     if output == "yaml":
-        dumped: str = yaml.safe_dump(result.to_dict(), sort_keys=False)
+        dumped: str = yaml.safe_dump(data, sort_keys=False)
         return dumped.rstrip()
+    raise InputError(
+        f"Unknown output format '{output}'. Choose from: {', '.join(OUTPUT_FORMATS)}."
+    )
+
+
+def render(result: Result, output: str) -> str:
+    if output in ("json", "yaml"):
+        return serialize_structured(result.to_dict(), output)
     if output == "markdown":
         return _render_markdown(result)
     if output == "junit":
@@ -195,11 +216,8 @@ def render(result: Result, output: str) -> str:
 
 
 def render_multi(result: MultiFabricResult, output: str) -> str:
-    if output == "json":
-        return json.dumps(result.to_dict(), indent=2, sort_keys=False)
-    if output == "yaml":
-        dumped: str = yaml.safe_dump(result.to_dict(), sort_keys=False)
-        return dumped.rstrip()
+    if output in ("json", "yaml"):
+        return serialize_structured(result.to_dict(), output)
     if output == "markdown":
         return _render_multi_markdown(result)
     if output == "junit":

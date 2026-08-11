@@ -30,6 +30,13 @@ def test_the_base_url_is_built_from_the_normalised_host() -> None:
     assert config.base_url == "https://nd.example.com"
 
 
+def test_an_http_host_prefix_uses_http_for_api_calls() -> None:
+    config = Config(host="http://nd.example.com", username="u", password="p")
+
+    assert config.scheme == "http"
+    assert config.base_url == "http://nd.example.com"
+
+
 def test_prechange_ui_url_points_at_the_nd_prechange_page() -> None:
     config = Config(host="nd.example.com", username="u", password="p")
 
