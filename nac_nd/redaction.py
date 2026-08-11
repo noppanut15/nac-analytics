@@ -76,9 +76,11 @@ class RedactingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()
-        except Exception:
-            # Unnamed arguments cannot be recognised as credentials, so they
-            # are withheld. The format string identifies the call site.
+        except (TypeError, ValueError, KeyError, IndexError):
+            # `%`-interpolation of the record's args failed (arity, format or
+            # key mismatch). The uninterpolated args cannot be scanned for
+            # credentials, so they are withheld; the format string still
+            # identifies the call site.
             message = f"{record.msg} [arguments withheld: interpolation failed]"
         record.msg = redact(message)
         # The message is already interpolated, so the arguments are cleared to

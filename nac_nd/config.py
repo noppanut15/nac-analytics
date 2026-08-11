@@ -16,13 +16,17 @@ def normalise_host(host: str) -> str:
 
     A host carrying its own scheme would produce `https://https://...`.
     """
+    return host_scheme(host)[1]
+
+
+def host_scheme(host: str) -> tuple[str, str]:
+    """Return ``(scheme, host)`` where scheme is ``https`` or ``http``."""
     value = host.strip()
     lowered = value.lower()
-    for scheme in ("https://", "http://"):
-        if lowered.startswith(scheme):
-            value = value[len(scheme) :]
-            break
-    return value.rstrip("/")
+    for prefix, scheme in (("https://", "https"), ("http://", "http")):
+        if lowered.startswith(prefix):
+            return scheme, value[len(prefix) :].rstrip("/")
+    return "https", value.rstrip("/")
 
 
 @dataclass
@@ -41,9 +45,10 @@ class Config:
     request_timeout_seconds: float = 60.0
     poll_interval_seconds: int = 15
     job_timeout_minutes: int = 30
+    scheme: str = field(init=False, default="https")
 
     def __post_init__(self) -> None:
-        self.host = normalise_host(self.host)
+        self.scheme, self.host = host_scheme(self.host)
         if not self.host:
             raise InputError("Nexus Dashboard host is required (--host or ND_HOST).")
         if not self.username:
@@ -64,7 +69,7 @@ class Config:
 
     @property
     def base_url(self) -> str:
-        return f"https://{self.host}"
+        return f"{self.scheme}://{self.host}"
 
     @property
     def prechange_ui_url(self) -> str:

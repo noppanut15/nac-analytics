@@ -35,6 +35,11 @@ plan.json
 plan-*.json
 *.tfplan
 approval.txt
+prechange-report.xml
+delta-report.xml
+
+# Local ND OpenAPI reference dumps (not part of the package)
+spec/
 
 # Editors
 .vscode/

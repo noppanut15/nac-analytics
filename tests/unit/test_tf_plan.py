@@ -117,3 +117,43 @@ def test_an_empty_terraform_plan_is_bad_input() -> None:
 
     with pytest.raises(InputError, match="no aci_rest_managed"):
         terraform_plan_to_payload(plan)
+
+
+def test_a_plan_spanning_two_top_level_roots_is_rejected() -> None:
+    """A change under both `uni` and `topology` cannot be one MO upload.
+
+    The previous implementation serialised only ``root.children[0]`` and
+    silently dropped every other root.
+    """
+    plan = {
+        "format_version": "1.2",
+        "resource_changes": [
+            {
+                "type": "aci_rest_managed",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "class_name": "fvTenant",
+                        "dn": "uni/tn-TEST",
+                        "content": {"name": "TEST"},
+                    },
+                },
+            },
+            {
+                "type": "aci_rest_managed",
+                "change": {
+                    "actions": ["create"],
+                    "before": None,
+                    "after": {
+                        "class_name": "commPol",
+                        "dn": "fabric/comm-default",
+                        "content": {"name": "default"},
+                    },
+                },
+            },
+        ],
+    }
+
+    with pytest.raises(InputError, match="more than one top-level DN root"):
+        terraform_plan_to_payload(plan)
