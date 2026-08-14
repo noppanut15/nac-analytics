@@ -48,6 +48,16 @@ DELTA_FAILED = frozenset(
     {"FAILED", "STOPPED", "ABORTED", "PARTIALLY_FAILED", "UNAVAILABLE"}
 )
 
+# Assurance analysis reports the same upper-case vocabulary as delta. A live
+# ND 4.2.1 run reports COMPLETE; SUCCESS is accepted because the API schema
+# lists both. The job is never filtered by type: the same trigger yields
+# ONLINE-ANALYSIS, ONLINE-ANALYSIS-ACI or ONLINE-ANALYSIS-NX depending on the
+# fabric, so only the job ID is a reliable filter.
+ANALYSIS_SUCCEEDED = frozenset({"SUCCESS", "COMPLETE"})
+ANALYSIS_FAILED = frozenset(
+    {"FAILED", "STOPPED", "ABORTED", "PARTIALLY_FAILED", "UNAVAILABLE"}
+)
+
 # How long a job may stay absent before it is treated as non-existent.
 # /jobs/summary returns HTTP 200 with an empty `entries` array for a job that
 # does not exist, so absence is indistinguishable from a job not yet listed.
@@ -253,6 +263,48 @@ def resolve_snapshot_ids(
     return prior_id, later_id
 
 
+def snapshot_newer_than(
+    snapshots: list[dict[str, Any]], baseline: str | None
+) -> dict[str, Any] | None:
+    """Return the newest snapshot collected strictly after `baseline`.
+
+    A `baseline` of None means the fabric had no snapshot to compare against,
+    so any record qualifies. Records with an unparseable
+    `collectionTimestamp` are skipped rather than guessed at.
+    """
+    if baseline is None:
+        ordered = sort_snapshots(snapshots)
+        return ordered[0] if ordered else None
+    floor = parse_timestamp(baseline)
+    if floor is None:
+        return None
+    for record in sort_snapshots(snapshots):
+        collected = parse_timestamp(str(record.get("collectionTimestamp", "")))
+        if collected is not None and collected > floor:
+            return record
+    return None
+
+
+def snapshot_for_job(
+    snapshots: list[dict[str, Any]], job_id: str, *, newer_than: str | None
+) -> dict[str, Any] | None:
+    """Return the newest snapshot this analysis job produced.
+
+    Both conditions matter. `analysisJobId` is not unique: the recurring
+    scheduled analysis keeps one job ID across cycles, so a single ID can name
+    several snapshots hours apart. And should a trigger ever be coalesced into
+    an already-running job, its ID would match a snapshot collected *before*
+    the trigger — the stale baseline this command exists to avoid. So a match
+    must also be newer than what was there beforehand.
+    """
+    matching = [
+        record
+        for record in snapshots
+        if str(record.get("analysisJobId", "")) == job_id and job_id
+    ]
+    return snapshot_newer_than(matching, newer_than)
+
+
 # -- jobs ------------------------------------------------------------------
 
 
@@ -288,6 +340,17 @@ def select_job(entries: list[dict[str, Any]], job_id: str) -> dict[str, Any] | N
         if str(entry.get("jobId", "")) == job_id:
             return entry
     return None
+
+
+def analysis_job_id(body: dict[str, Any]) -> str:
+    """Return the job ID `POST /jobs/assuranceAnalysis` reports.
+
+    The ID reappears verbatim as the resulting snapshot's `analysisJobId`.
+    """
+    job_id = body.get("jobId")
+    if not job_id:
+        raise JobError("Assurance analysis was triggered but returned no jobId.")
+    return str(job_id)
 
 
 class AbsenceWindow:
@@ -614,6 +677,125 @@ class NDClient:
                 f"Fabric '{fabric}' has no finished snapshots to analyse against."
             )
         return select_snapshot(snapshots, selector)
+
+    # -- assurance analysis ------------------------------------------------
+
+    def latest_collection_timestamp(self, fabric: str) -> str | None:
+        """Return the newest finished snapshot's `collectionTimestamp`.
+
+        None when the fabric has never produced one. Callers take this before
+        triggering an analysis so a snapshot that predates the trigger is not
+        mistaken for its result.
+        """
+        snapshots = finished_snapshots(self.list_snapshots(fabric))
+        if not snapshots:
+            return None
+        return str(snapshots[0].get("collectionTimestamp", "")) or None
+
+    def trigger_assurance_analysis(self, fabric: str) -> str:
+        """Start an on-demand assurance analysis and return its job ID.
+
+        This is the API behind the GUI's "Analyze now". It requires the
+        super-admin, fabric-admin or support-engineer role; an observer
+        account is refused with HTTP 403.
+        """
+        body = self.post_json(
+            f"{ANALYZE}/jobs/assuranceAnalysis", json={"fabricName": fabric}
+        )
+        job_id = analysis_job_id(body)
+        logger.debug("Assurance analysis %s started on %s", job_id, fabric)
+        return job_id
+
+    def wait_for_analysis_snapshot(
+        self, fabric: str, job_id: str, *, baseline: str | None
+    ) -> dict[str, Any]:
+        """Wait for an assurance analysis to produce a finished snapshot.
+
+        The job is polled before the snapshot list because no snapshot is
+        visible until the job is terminal, and because a failed job explains
+        itself where an absent snapshot cannot.
+        """
+        deadline = time.monotonic() + self.config.job_timeout_minutes * 60
+        window = AbsenceWindow(self.config.poll_interval_seconds)
+        job_done = False
+        while True:
+            if not job_done:
+                job_done = self._analysis_job_finished(job_id, window)
+            if job_done:
+                record = self._analysis_snapshot(fabric, job_id, baseline)
+                if record is not None:
+                    return record
+                logger.debug(
+                    "Analysis %s finished; waiting for its snapshot...", job_id
+                )
+            if time.monotonic() > deadline:
+                raise JobError(
+                    f"Assurance analysis {job_id} did not produce a finished "
+                    f"snapshot within {self.config.job_timeout_minutes} minutes. "
+                    "A full fabric collection can take considerably longer than "
+                    "the default; raise --timeout."
+                )
+            time.sleep(self.config.poll_interval_seconds)
+
+    def _analysis_job_finished(self, job_id: str, window: AbsenceWindow) -> bool:
+        """True once the analysis job has succeeded; raises if it failed.
+
+        The job is filtered by ID alone. Its `jobType` varies with the fabric
+        (ONLINE-ANALYSIS, -ACI or -NX), so filtering on type would drop it.
+        """
+        job = select_job(self.job_summary(job_id=job_id), job_id)
+        if job is None:
+            if window.missing():
+                raise JobError(
+                    f"Assurance analysis {job_id} was never reported by "
+                    f"{ANALYZE}/jobs/summary after {window.polls} polls "
+                    f"(~{window.approx_seconds}s). The endpoint answers 200 "
+                    "with no entries for a job that does not exist."
+                )
+            logger.debug(
+                "Assurance analysis %s not visible yet (%d/%d)...",
+                job_id,
+                window.polls,
+                window.limit,
+            )
+            return False
+        window.seen()
+        status = str(job.get("status", "")).upper()
+        if status in ANALYSIS_SUCCEEDED:
+            return True
+        if status in ANALYSIS_FAILED:
+            parts = [f"Assurance analysis {job_id} ended {status}."]
+            message = str(job.get("errorMessage", "")).strip()
+            if message:
+                parts.append(message)
+            if status == "PARTIALLY_FAILED":
+                parts.append(
+                    "A partial collection produces a snapshot whose status is "
+                    "not 'finished', so it cannot be used for delta analysis."
+                )
+            raise JobError(" ".join(parts))
+        logger.debug("Assurance analysis %s is %s...", job_id, status or "pending")
+        return False
+
+    def _analysis_snapshot(
+        self, fabric: str, job_id: str, baseline: str | None
+    ) -> dict[str, Any] | None:
+        """Find the snapshot a finished analysis produced, if it has landed."""
+        snapshots = finished_snapshots(self.list_snapshots(fabric))
+        record = snapshot_for_job(snapshots, job_id, newer_than=baseline)
+        if record is not None:
+            return record
+        fallback = snapshot_newer_than(snapshots, baseline)
+        if fallback is not None:
+            self.notice(
+                "Snapshot %s is newer than the analysis was triggered but "
+                "carries analysisJobId %r, not %r. Reporting it anyway; verify "
+                "it describes the change you expect.",
+                fallback.get("snapshotId"),
+                str(fallback.get("analysisJobId", "")),
+                job_id,
+            )
+        return fallback
 
     # -- pre-change analysis -----------------------------------------------
 

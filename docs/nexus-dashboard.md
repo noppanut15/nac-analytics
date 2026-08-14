@@ -38,6 +38,7 @@ Commands:
   prechange   Analyse a candidate configuration against a fabric's current state.
   delta       Compare two snapshots of a fabric and report what changed.
   snapshots   Resolve a fabric snapshot and print its ID (for CI baseline pinning).
+  analyze     Trigger an assurance analysis and print the snapshot ID it produces.
   compliance  Report compliance rule status for a fabric (or every fabric with --all).
   doctor      Check connectivity, credentials, and fabric visibility.
 ```
@@ -49,5 +50,6 @@ Commands:
 | [prechange](commands/nexus-dashboard/prechange.md) | Gate a planned change — Terraform plan JSON or APIC MO JSON |
 | [delta](commands/nexus-dashboard/delta.md) | Post-change comparison between two snapshots |
 | [snapshots](commands/nexus-dashboard/snapshots.md) | Print a snapshot ID for pipeline pinning |
+| [analyze](commands/nexus-dashboard/analyze.md) | Trigger an assurance analysis and print the snapshot it produces |
 | [compliance](commands/nexus-dashboard/compliance.md) | Fabric compliance rules; optional `--fail-on-violations` |
 | [doctor](commands/nexus-dashboard/doctor.md) | Read-only connectivity and credential check |
