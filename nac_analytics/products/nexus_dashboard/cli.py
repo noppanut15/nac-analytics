@@ -413,6 +413,28 @@ def _emit_snapshot(record: dict[str, object], output: str) -> None:
     typer.echo(serialize_structured(record, output))
 
 
+def _emit_notices(client: NDClient) -> None:
+    """Print a client's operational warnings to stderr, keeping stdout clean."""
+    for warning in client.notices:
+        typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
+
+
+def _analysis_trigger_error(exc: ApiError) -> Exception:
+    """Explain a refused assurance analysis trigger.
+
+    Triggering needs the super-admin, fabric-admin or support-engineer role, so
+    a 403 is an RBAC fact the operator can act on rather than a transport
+    failure, and it exits as an auth error.
+    """
+    if "HTTP 403" not in str(exc):
+        return exc
+    return AuthError(
+        "Not permitted to trigger an assurance analysis. This API requires the "
+        "super-admin, fabric-admin or support-engineer role; an observer "
+        f"account can read snapshots but cannot start one. ({exc})"
+    )
+
+
 def _resolve_pre_post(
     pre: str | None,
     post: str | None,
@@ -815,8 +837,86 @@ def snapshots(
             record = client.resolve_snapshot(
                 config.fabric, selector, start_date=since, end_date=until
             )
-            for warning in client.notices:
-                typer.secho(f"warning: {warning}", fg=typer.colors.YELLOW, err=True)
+            _emit_notices(client)
+        _emit_snapshot(record, output)
+    except Exception as exc:
+        raise _fail(exc, verbose) from exc
+
+
+@app.command()
+def analyze(
+    host: HostOpt = None,
+    username: UserOpt = None,
+    password: PasswordOpt = None,
+    domain: DomainOpt = DEFAULT_DOMAIN,
+    fabric: FabricOpt = None,
+    no_wait: Annotated[
+        bool,
+        typer.Option(
+            "--no-wait",
+            help=(
+                "Print the analysis job ID and exit instead of waiting. This is "
+                "a job ID, not a snapshotId; it cannot be passed to delta."
+            ),
+        ),
+    ] = False,
+    output: Annotated[
+        str,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output format: text (snapshot ID only), json, or yaml.",
+        ),
+    ] = "text",
+    timeout: TimeoutOpt = 30,
+    poll_interval: PollOpt = 15,
+    verify_ssl: VerifyOpt = True,
+    ca_bundle: CaBundleOpt = None,
+    verbose: VerboseOpt = False,
+) -> None:
+    """Trigger an assurance analysis and print the snapshot ID it produces."""
+    _configure_logging(verbose)
+    try:
+        if output not in ("text", "json", "yaml"):
+            raise InputError(
+                f"Unknown output format '{output}'. Choose from: text, json, yaml."
+            )
+        config = _build_config(
+            host=host,
+            username=username,
+            password=password,
+            domain=domain,
+            fabric=fabric,
+            verify_ssl=verify_ssl,
+            ca_bundle=ca_bundle,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+        note(_connect_message(config))
+        with NDClient(config) as client:
+            client.validate_fabric(config.fabric)
+            # Taken before triggering so a snapshot that already existed can
+            # never be mistaken for the one this run produces.
+            baseline = (
+                None if no_wait else client.latest_collection_timestamp(config.fabric)
+            )
+            note(f"Triggering an assurance analysis on {config.fabric}...")
+            try:
+                job_id = client.trigger_assurance_analysis(config.fabric)
+            except ApiError as exc:
+                raise _analysis_trigger_error(exc) from exc
+            if no_wait:
+                _emit_notices(client)
+                typer.echo(job_id)
+                return
+            note(
+                f"Waiting for analysis {job_id} to produce a snapshot "
+                f"(up to {timeout} minutes)..."
+            )
+            record = client.wait_for_analysis_snapshot(
+                config.fabric, job_id, baseline=baseline
+            )
+            _emit_notices(client)
         _emit_snapshot(record, output)
     except Exception as exc:
         raise _fail(exc, verbose) from exc

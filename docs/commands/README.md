@@ -42,5 +42,6 @@ Commands:
 | [prechange](nexus-dashboard/prechange.md) | Analyse a candidate config against current fabric state |
 | [delta](nexus-dashboard/delta.md) | Compare two snapshots and report changes |
 | [snapshots](nexus-dashboard/snapshots.md) | Resolve a snapshot ID (CI baseline pinning) |
+| [analyze](nexus-dashboard/analyze.md) | Trigger an assurance analysis and print the snapshot it produces |
 | [compliance](nexus-dashboard/compliance.md) | Report compliance rule status |
 | [doctor](nexus-dashboard/doctor.md) | Check connectivity, credentials, fabric visibility |

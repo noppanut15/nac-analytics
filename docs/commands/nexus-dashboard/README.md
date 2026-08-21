@@ -13,6 +13,7 @@ Product-level help (configuration variables and verb list) is in [Nexus Dashboar
 | [prechange](prechange.md) | Gate a planned change — Terraform plan JSON or APIC MO JSON |
 | [delta](delta.md) | Post-change comparison between two snapshots |
 | [snapshots](snapshots.md) | Print a snapshot ID for pipeline pinning |
+| [analyze](analyze.md) | Trigger an assurance analysis and print the snapshot it produces |
 | [compliance](compliance.md) | Fabric compliance rules; optional `--fail-on-violations` |
 | [doctor](doctor.md) | Read-only connectivity and credential check |
 
